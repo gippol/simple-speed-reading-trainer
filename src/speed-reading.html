@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Speed Reading Trainer</title>
+<style>
+  :root { --hl: #ffeb3b; --bg: #fafafa; --fg: #222; --panel: #fff; --line: #ddd; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1b1b1b; --fg: #e6e6e6; --panel: #262626; --line: #444; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font-family: system-ui, sans-serif; }
+  header {
+    position: sticky; top: 0; z-index: 1; background: var(--panel);
+    border-bottom: 1px solid var(--line); padding: 10px 16px;
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+  }
+  label { display: flex; align-items: center; gap: 6px; font-size: 14px; }
+  input[type=number] { width: 80px; }
+  button { padding: 6px 16px; font-size: 14px; cursor: pointer; }
+  #time { font-variant-numeric: tabular-nums; font-size: 20px; min-width: 90px; }
+  #status { font-size: 13px; opacity: .8; }
+  #drop { padding: 24px 16px; text-align: center; opacity: .7; }
+  #text {
+    max-width: var(--mw, 800px); margin: 0 auto; padding: 24px 16px 60vh;
+    font-size: 22px; line-height: var(--lh, 1.5); white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .w { cursor: pointer; border-radius: 3px; padding: 1px 0; }
+  .w.on { background: var(--hl); color: #000; }
+  body.dragging { outline: 3px dashed var(--hl); outline-offset: -8px; }
+</style>
+</head>
+<body>
+<header>
+  <input type="file" id="file" accept=".txt,text/plain">
+  <button id="paste" title="クリップボードのテキストを読み込む (Ctrl+V でも可)">貼り付け</button>
+  <label>WPM <input type="number" id="wpm" min="50" max="1500" step="10" value="300"></label>
+  <label>色 <input type="color" id="color" value="#ffeb3b"></label>
+  <label>行間 <input type="number" id="lh" min="1" max="4" step="0.1" value="2"></label>
+  <label>幅 <input type="number" id="mw" min="300" max="2000" step="50" value="800">px</label>
+  <button id="start" disabled>START</button>
+  <button id="stop" disabled>STOP</button>
+  <button id="reset" disabled>RESET</button>
+  <span id="time">00:00.0</span>
+  <span id="status"></span>
+</header>
+
+<div id="drop">テキストファイル(.txt)を選択・ドロップ、またはテキストを貼り付け(Ctrl+V)してください</div>
+<div id="text"></div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const els = { file: $('file'), paste: $('paste'), wpm: $('wpm'), color: $('color'), lh: $('lh'), mw: $('mw'), start: $('start'),
+                stop: $('stop'), reset: $('reset'), time: $('time'), status: $('status'),
+                drop: $('drop'), text: $('text') };
+
+  let words = [];        // span elements
+  let pos = -1;          // currently highlighted index (-1: none)
+  let running = false;
+  let startHere = false; // set by clicking a word while stopped
+  let elapsed = 0;       // accumulated ms before the current run
+  let runStart = 0;      // performance.now() when current run began
+  let nextAt = 0;        // performance.now() of next word change
+  let timer = null;      // setTimeout id for word advance
+  let raf = null;        // requestAnimationFrame id for clock
+
+  // ---- settings ----
+  const clampWpm = v => Math.min(1500, Math.max(50, Math.round(Number(v)) || 300));
+  const clampLh = v => Math.min(4, Math.max(1, Math.round(Number(v) * 10) / 10 || 2));
+  const clampMw = v => Math.min(2000, Math.max(300, Math.round(Number(v)) || 800));
+  const saveSettings = () => {
+    try {
+      localStorage.setItem('srt', JSON.stringify({
+        wpm: els.wpm.value, color: els.color.value, lh: els.lh.value, mw: els.mw.value }));
+    } catch {}
+  };
+  const applyColor = () => document.documentElement.style.setProperty('--hl', els.color.value);
+  const applyLayout = () => {
+    const st = document.documentElement.style;
+    st.setProperty('--lh', clampLh(els.lh.value));
+    st.setProperty('--mw', clampMw(els.mw.value) + 'px');
+  };
+  try {
+    const s = JSON.parse(localStorage.getItem('srt') || '{}');
+    if (s.wpm) els.wpm.value = clampWpm(s.wpm);
+    if (s.color) els.color.value = s.color;
+    if (s.lh) els.lh.value = clampLh(s.lh);
+    if (s.mw) els.mw.value = clampMw(s.mw);
+  } catch {}
+  applyColor();
+  applyLayout();
+
+  els.wpm.addEventListener('change', () => { els.wpm.value = clampWpm(els.wpm.value); saveSettings(); });
+  els.color.addEventListener('input', () => { applyColor(); saveSettings(); });
+  els.lh.addEventListener('input', () => { applyLayout(); saveSettings(); });
+  els.mw.addEventListener('input', () => { applyLayout(); saveSettings(); });
+  els.lh.addEventListener('change', () => { els.lh.value = clampLh(els.lh.value); applyLayout(); saveSettings(); });
+  els.mw.addEventListener('change', () => { els.mw.value = clampMw(els.mw.value); applyLayout(); saveSettings(); });
+
+  // ---- rendering ----
+  function loadText(str) {
+    stop();
+    els.text.textContent = '';
+    words = [];
+    // keep whitespace (incl. newlines) as text nodes between word spans
+    for (const tok of str.split(/(\s+)/)) {
+      if (!tok) continue;
+      if (/^\s+$/.test(tok)) { els.text.append(tok); continue; }
+      const sp = document.createElement('span');
+      sp.className = 'w';
+      sp.dataset.i = words.length;
+      sp.textContent = tok;
+      words.push(sp);
+      els.text.append(sp);
+    }
+    els.drop.style.display = words.length ? 'none' : '';
+    reset();
+  }
+
+  function setPos(i) {
+    if (words[pos]) words[pos].classList.remove('on');
+    pos = i;
+    const w = words[pos];
+    if (!w) return;
+    w.classList.add('on');
+    const r = w.getBoundingClientRect();
+    const top = document.querySelector('header').offsetHeight;
+    if (r.top < top + 40 || r.bottom > innerHeight * 0.7) w.scrollIntoView({ block: 'center' });
+  }
+
+  // ---- clock ----
+  const fmt = ms => {
+    const t = Math.floor(ms / 100) / 10, m = Math.floor(t / 60), s = t - m * 60;
+    return String(m).padStart(2, '0') + ':' + s.toFixed(1).padStart(4, '0');
+  };
+  const now = () => elapsed + (running ? performance.now() - runStart : 0);
+  const tickClock = () => { els.time.textContent = fmt(now()); if (running) raf = requestAnimationFrame(tickClock); };
+
+  // ---- run control ----
+  const interval = () => 60000 / clampWpm(els.wpm.value);
+
+  function step() {
+    if (!running) return;
+    if (pos + 1 >= words.length) { finish(); return; }
+    setPos(pos + 1);
+    // schedule against an absolute time to avoid drift
+    nextAt += interval();
+    timer = setTimeout(step, Math.max(0, nextAt - performance.now()));
+  }
+
+  function start() {
+    if (running || !words.length) return;
+    if (!startHere && pos >= words.length - 1) reset();
+    running = true;
+    runStart = performance.now();
+    nextAt = runStart;       // first word of this run lights immediately
+    els.status.textContent = '';
+    updateButtons();
+    if (startHere) {
+      startHere = false;
+      nextAt += interval();
+      timer = setTimeout(step, interval());
+    } else {
+      step();
+    }
+    tickClock();
+  }
+
+  function stop() {
+    if (!running) return;
+    elapsed += performance.now() - runStart;
+    running = false;
+    clearTimeout(timer);
+    cancelAnimationFrame(raf);
+    els.time.textContent = fmt(elapsed);
+    updateButtons();
+  }
+
+  function finish() {
+    stop();
+    const min = elapsed / 60000;
+    els.status.textContent = `読了: ${words.length}語 / ${fmt(elapsed)} / 実効 ${Math.round(words.length / min)} WPM`;
+  }
+
+  function reset() {
+    stop();
+    if (words[pos]) words[pos].classList.remove('on');
+    pos = -1;
+    startHere = false;
+    elapsed = 0;
+    els.time.textContent = fmt(0);
+    els.status.textContent = '';
+    updateButtons();
+  }
+
+  function updateButtons() {
+    els.start.disabled = running || !words.length;
+    els.stop.disabled = !running;
+    els.reset.disabled = !words.length;
+  }
+
+  // ---- events ----
+  els.start.onclick = start;
+  els.stop.onclick = stop;
+  els.reset.onclick = reset;
+
+  // click a word: move the start position (resumes from the next word)
+  els.text.addEventListener('click', e => {
+    const w = e.target.closest('.w');
+    if (!w) return;
+    const i = +w.dataset.i;
+    if (running) {
+      // restart the cadence from the clicked word
+      clearTimeout(timer);
+      setPos(i);
+      nextAt = performance.now() + interval();
+      timer = setTimeout(step, interval());
+    } else {
+      setPos(i);
+      startHere = true;   // next START lights the clicked word itself
+      els.status.textContent = '';
+    }
+  });
+
+  function readFile(f) {
+    if (!f) return;
+    const fr = new FileReader();
+    fr.onload = () => loadText(String(fr.result));
+    fr.readAsText(f);
+  }
+  els.file.onchange = () => readFile(els.file.files[0]);
+  // paste: Ctrl/Cmd+V anywhere (except in form fields) replaces the current text
+  addEventListener('paste', e => {
+    if (e.target.closest && e.target.closest('input, textarea')) return;
+    const t = e.clipboardData && e.clipboardData.getData('text');
+    if (!t || !t.trim()) return;
+    e.preventDefault();
+    loadText(t);
+  });
+  els.paste.onclick = async () => {
+    try {
+      const t = await navigator.clipboard.readText();
+      if (t && t.trim()) loadText(t);
+      else els.status.textContent = 'クリップボードにテキストがありません';
+    } catch {
+      els.status.textContent = '読み取れません。Ctrl+V で貼り付けてください';
+    }
+  };
+  addEventListener('dragover', e => { e.preventDefault(); document.body.classList.add('dragging'); });
+  addEventListener('dragleave', e => { if (!e.relatedTarget) document.body.classList.remove('dragging'); });
+  addEventListener('drop', e => {
+    e.preventDefault();
+    document.body.classList.remove('dragging');
+    readFile(e.dataTransfer.files[0]);
+  });
+})();
+</script>
+</body>
+</html>
