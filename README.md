@@ -1,4 +1,4 @@
-# Speed Reading Trainer
+# Simple Speed Reading Trainer
 
 英文テキストを 1 語ずつハイライトして、指定した WPM(1 分あたりの語数)で読む速読トレーニング用アプリです。`speed-reading.html` 1 ファイルで動作し、ビルドや依存パッケージは不要です。
 
